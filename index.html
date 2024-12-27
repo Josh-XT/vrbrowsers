@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VR Workspace</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { margin: 0; }
+        canvas { display: block; }
+        #status {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="status"></div>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/examples/jsm/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { XRControllerModelFactory } from 'three/examples/jsm/webxr/XRControllerModelFactory.js';
+
+        class MultiBrowserVR {
+            constructor() {
+                this.scene = new THREE.Scene();
+                this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                this.renderer = new THREE.WebGLRenderer({ 
+                    antialias: true,
+                    alpha: true  // Required for passthrough
+                });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.xr.enabled = true;
+                document.body.appendChild(this.renderer.domElement);
+
+                // Load saved layout on startup
+                this.savedLayouts = this.loadSavedLayouts();
+                
+                this.browsers = new Map(); // Store browser windows and their states
+                this.selectedBrowser = null;
+                this.raycaster = new THREE.Raycaster();
+                
+                this.setupControllers();
+                this.setupEnvironment();
+
+                // Handle window resizing
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                });
+            }
+            
+            loadSavedLayouts() {
+                const saved = localStorage.getItem('vrBrowserLayouts');
+                return saved ? JSON.parse(saved) : {
+                    default: {
+                        name: 'Default Layout',
+                        windows: [
+                            { url: 'https://github.com', position: { x: 2, y: 1.6, z: -3 } },
+                            { url: 'https://discord.com/app', position: { x: 0, y: 1.6, z: -3 } },
+                            { url: 'https://remote.desktop.url', position: { x: -2, y: 1.6, z: -3 } }
+                        ]
+                    }
+                };
+            }
+
+            setupEnvironment() {
+                // Add subtle ambient light
+                const ambientLight = new THREE.AmbientLight(0x404040);
+                this.scene.add(ambientLight);
+
+                // Add a grid helper for orientation
+                const gridHelper = new THREE.GridHelper(10, 10);
+                this.scene.add(gridHelper);
+            }
+            
+            setupControllers() {
+                const controllerModelFactory = new XRControllerModelFactory();
+                
+                // Controller 1 - Main interaction
+                this.controller1 = this.renderer.xr.getController(0);
+                this.controller1.addEventListener('select', () => this.handleSelect());
+                this.controller1.addEventListener('selectstart', () => this.handleGrabStart());
+                this.controller1.addEventListener('selectend', () => this.handleGrabEnd());
+                
+                this.controllerGrip1 = this.renderer.xr.getControllerGrip(0);
+                this.controllerGrip1.add(controllerModelFactory.createControllerModel(this.controllerGrip1));
+                
+                this.scene.add(this.controller1);
+                this.scene.add(this.controllerGrip1);
+
+                // Add ray visualization
+                const geometry = new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(0, 0, 0),
+                    new THREE.Vector3(0, 0, -1)
+                ]);
+                const material = new THREE.LineBasicMaterial({
+                    color: 0xffffff
+                });
+                this.ray = new THREE.Line(geometry, material);
+                this.ray.scale.z = 5;
+                this.controller1.add(this.ray);
+            }
+            
+            async createBrowserWindow(url, position, dimensions = { width: 2, height: 1.5 }) {
+                // Create iframe for content
+                const iframe = document.createElement('iframe');
+                iframe.src = url;
+                iframe.style.width = '1024px';  // Base resolution
+                iframe.style.height = '768px';
+                iframe.style.border = 'none';
+                document.body.appendChild(iframe);
+                
+                // Create canvas to render iframe content
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = 1024;
+                canvas.height = 768;
+                
+                // Create Three.js objects
+                const geometry = new THREE.PlaneGeometry(dimensions.width, dimensions.height);
+                const texture = new THREE.CanvasTexture(canvas);
+                const material = new THREE.MeshBasicMaterial({ 
+                    map: texture,
+                    side: THREE.DoubleSide
+                });
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.position.copy(position);
+                
+                // Store browser data
+                this.browsers.set(mesh.id, {
+                    mesh,
+                    iframe,
+                    canvas,
+                    ctx,
+                    texture,
+                    url
+                });
+                
+                this.scene.add(mesh);
+                
+                // Setup update loop for this browser
+                this.setupBrowserUpdates(mesh.id);
+                
+                return mesh;
+            }
+            
+            saveCurrentLayout(name = 'default') {
+                const layout = {
+                    name: name,
+                    windows: Array.from(this.browsers.values()).map(browser => ({
+                        url: browser.url,
+                        position: {
+                            x: browser.mesh.position.x,
+                            y: browser.mesh.position.y,
+                            z: browser.mesh.position.z
+                        }
+                    }))
+                };
+
+                this.savedLayouts[name] = layout;
+                localStorage.setItem('vrBrowserLayouts', JSON.stringify(this.savedLayouts));
+            }
+
+            async loadLayout(name = 'default') {
+                // Clear existing browsers
+                for (const [_, browser] of this.browsers) {
+                    this.scene.remove(browser.mesh);
+                    browser.iframe.remove();
+                }
+                this.browsers.clear();
+
+                // Load saved layout
+                const layout = this.savedLayouts[name];
+                if (layout) {
+                    for (const window of layout.windows) {
+                        const position = new THREE.Vector3(
+                            window.position.x,
+                            window.position.y,
+                            window.position.z
+                        );
+                        await this.createBrowserWindow(window.url, position);
+                    }
+                }
+            }
+            
+            async start() {
+                // Load last used layout
+                await this.loadLayout();
+                
+                // Check if passthrough is available
+                if (navigator.xr) {
+                    const supported = await navigator.xr.isSessionSupported('immersive-ar');
+                    if (supported) {
+                        this.sessionInit = {
+                            requiredFeatures: ['local-floor', 'hand-tracking', 'mesh-detection'],
+                            optionalFeatures: ['dom-overlay', 'camera-access'],
+                            domOverlay: { root: document.body },
+                        };
+                    }
+                }
+
+                // Create custom button that supports both VR and AR
+                const button = document.createElement('button');
+                button.style.cssText = `
+                    position: fixed;
+                    bottom: 20px;
+                    left: 50%;
+                    transform: translateX(-50%);
+                    padding: 12px 24px;
+                    border: none;
+                    border-radius: 4px;
+                    background: #ffffff;
+                    color: #000000;
+                    font-size: 16px;
+                    cursor: pointer;
+                `;
+                button.textContent = 'Enter Mixed Reality';
+                
+                button.addEventListener('click', async () => {
+                    // Try AR (passthrough) first, fall back to VR if not available
+                    try {
+                        const session = await navigator.xr.requestSession('immersive-ar', this.sessionInit);
+                        await this.renderer.xr.setSession(session);
+                        document.getElementById('status').textContent = 'Using Passthrough';
+                    } catch (e) {
+                        console.log('Passthrough not available, falling back to VR');
+                        const session = await navigator.xr.requestSession('immersive-vr');
+                        await this.renderer.xr.setSession(session);
+                        document.getElementById('status').textContent = 'Using VR Mode';
+                    }
+                });
+                
+                document.body.appendChild(button);
+
+                // Start render loop
+                this.renderer.setAnimationLoop(() => {
+                    this.render();
+                });
+            }
+            
+            render() {
+                // Update raycaster
+                this.raycaster.setFromCamera(
+                    new THREE.Vector2(0, 0),
+                    this.camera
+                );
+                
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+
+        // Start the application
+        const app = new MultiBrowserVR();
+        app.start();
+    </script>
+</body>
+</html>
